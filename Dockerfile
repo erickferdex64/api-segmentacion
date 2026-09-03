@@ -17,16 +17,11 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
-# The NVIDIA apt repos baked into the CUDA images break apt-get update from time to time
-# (stale keys / missing Release file). We do not need them: remove them before installing.
-RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list \
- && apt-get update -o Acquire::Retries=3 \
- && apt-get install -y --no-install-recommends git ninja-build \
- && rm -rf /var/lib/apt/lists/*
-
+# No apt-get anywhere in this build (Runpod's builders cannot always reach the Ubuntu mirrors):
+# the two repos are downloaded as tarballs with python, ninja comes from PyPI.
 WORKDIR /build
-RUN git clone --depth 1 https://github.com/XiShuFan/CrossTooth_CVPR2025.git \
- && git clone --depth 1 https://github.com/POSTECH-CVLab/point-transformer.git
+COPY fetch_repos.py /build/fetch_repos.py
+RUN python /build/fetch_repos.py /build
 
 # pointops: <THC/THC.h> no longer exists in modern PyTorch -> drop the include (same fix as the notebook),
 # then build the extension as a wheel so the runtime stage does not need nvcc.
@@ -47,7 +42,7 @@ RUN mkdir -p CrossTooth_CVPR2025/models/PointTransformer/libs \
  && touch CrossTooth_CVPR2025/models/PointTransformer/__init__.py \
           CrossTooth_CVPR2025/models/PointTransformer/libs/__init__.py \
  && python patch_pointops.py CrossTooth_CVPR2025/models/PointTransformer/libs/pointops/functions/pointops.py \
- && rm -rf CrossTooth_CVPR2025/.git CrossTooth_CVPR2025/compete CrossTooth_CVPR2025/YBSESUN6_upper.obj
+ && rm -rf CrossTooth_CVPR2025/compete CrossTooth_CVPR2025/YBSESUN6_upper.obj
 
 # ---------------------------------------------------------------- stage 2 ---
 FROM pytorch/pytorch:${PYTORCH_TAG}-runtime
@@ -57,13 +52,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     CROSSTOOTH_DIR=/app/CrossTooth_CVPR2025 \
     WARMUP=1
-
-# shared libraries VTK (vedo) may dlopen even when running headless
-RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list \
- && apt-get update -o Acquire::Retries=3 \
- && apt-get install -y --no-install-recommends \
-      libgl1 libxrender1 libxext1 libsm6 libice6 libx11-6 libgomp1 \
- && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
