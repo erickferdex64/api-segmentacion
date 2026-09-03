@@ -17,8 +17,12 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ninja-build \
-    && rm -rf /var/lib/apt/lists/*
+# The NVIDIA apt repos baked into the CUDA images break apt-get update from time to time
+# (stale keys / missing Release file). We do not need them: remove them before installing.
+RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list \
+ && apt-get update -o Acquire::Retries=3 \
+ && apt-get install -y --no-install-recommends git ninja-build \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 RUN git clone --depth 1 https://github.com/XiShuFan/CrossTooth_CVPR2025.git \
@@ -55,9 +59,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WARMUP=1
 
 # shared libraries VTK (vedo) may dlopen even when running headless
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/nvidia*.list \
+ && apt-get update -o Acquire::Retries=3 \
+ && apt-get install -y --no-install-recommends \
       libgl1 libxrender1 libxext1 libsm6 libice6 libx11-6 libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
