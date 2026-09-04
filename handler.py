@@ -8,6 +8,8 @@ Request  (job["input"]):
   jaw               "upper" | "lower"  (only changes tooth names / FDI numbers in the reply)
   flip_z, flip_y    true/false to force the orientation, omit for auto-detection
   target_faces      decimation target (default 15999 -> the model sees 16000 points)
+  seed              random seed for the point shuffle (default 1); change it to get another "draw"
+  n_runs            test-time ensemble: run the network on n_runs shuffles and majority-vote (default 5)
   output_frame      "original" (default, aligned with the input STL) | "model" (rotated frame)
   ascii_ply         write an ASCII PLY instead of binary (default false)
   compress_output   gzip the PLY before base64 (default false)
@@ -87,25 +89,43 @@ print(f"[init] model loaded in {time.time() - t_init:.1f}s", flush=True)
 
 
 @torch.no_grad()
-def predict_labels(ply_path):
+def predict_labels(ply_path, seed=SEED, n_runs=1):
     """
     Same maths as predict.py:  mesh -> (face centre, face normal) x 16000 -> PointTransformerSeg38.
-    Returns labels (n,), face centres (n,3) and face vertex indices (n,3) for the predicted faces
-    (padding rows are dropped).  Coordinates are those of the PLY (model frame).
-    """
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    pointcloud, point_coords, face_info = DATASET.get_by_name(ply_path)
-    pointcloud = pointcloud.unsqueeze(0).to(DEVICE).permute(0, 2, 1).contiguous()   # (1, 6, N)
-    seg_logits, _edge = MODEL(pointcloud)                                             # (1, 19, N)
-    pred = torch.softmax(seg_logits, dim=1).argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int64)
-    pred[pred >= 17] = 0                                                              # extra classes -> gum
 
-    face_info = np.asarray(face_info).astype(np.int64)
-    valid = ~np.all(face_info == 0, axis=1)                                           # padding rows
+    The original code shuffles the points with an unseeded np.random.permutation, and the
+    network's farthest-point sampling depends on that order, so predict.py gives slightly
+    different results on every run.  Here the shuffle is seeded (reproducible) and, with
+    n_runs > 1, the network is run on n_runs different shuffles and every face takes the
+    majority label (test-time ensemble).
+
+    Returns labels (n,), face centres (n,3), face vertex indices (n,3) for the predicted faces
+    (padding rows dropped), the mesh points, and the per-face agreement (fraction of runs that
+    voted for the winning label).  Coordinates are those of the PLY (model frame).
+    """
+    n_runs = max(1, int(n_runs))
+    votes = {}                                   # face (tuple of 3 vertex ids) -> [count per label]
+    for r in range(n_runs):
+        np.random.seed(int(seed) + r)
+        torch.manual_seed(int(seed) + r)
+        pointcloud, point_coords, face_info = DATASET.get_by_name(ply_path)
+        pointcloud = pointcloud.unsqueeze(0).to(DEVICE).permute(0, 2, 1).contiguous()   # (1, 6, N)
+        seg_logits, _edge = MODEL(pointcloud)                                             # (1, 19, N)
+        pred = torch.softmax(seg_logits, dim=1).argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int64)
+        pred[pred >= 17] = 0                                                              # extra classes -> gum
+        face_info = np.asarray(face_info).astype(np.int64)
+        valid = ~np.all(face_info == 0, axis=1)                                           # padding rows
+        for f, lab in zip(map(tuple, face_info[valid]), pred[valid]):
+            v = votes.setdefault(f, np.zeros(17, np.int32))
+            v[lab] += 1
+
+    faces = np.array(list(votes.keys()), dtype=np.int64)
+    counts = np.stack(list(votes.values()))                                                # (n, 17)
+    labels = counts.argmax(axis=1).astype(np.int64)                                       # ties -> lowest label
+    agreement = counts.max(axis=1) / counts.sum(axis=1)
     point_coords = np.asarray(point_coords, dtype=np.float64)
-    centers = point_coords[face_info[valid]].mean(axis=1)
-    return pred[valid], centers, face_info[valid], point_coords
+    centers = point_coords[faces].mean(axis=1)
+    return labels, centers, faces, point_coords, agreement
 
 
 # --------------------------------------------------------------------------- #
@@ -208,6 +228,10 @@ def handler(job):
         target_faces = int(inp.get("target_faces", 15999))
         if not (1000 <= target_faces <= NUM_POINTS):
             raise ValueError(f"target_faces must be between 1000 and {NUM_POINTS}")
+        seed = int(inp.get("seed", SEED))
+        n_runs = int(inp.get("n_runs", 5))
+        if not (1 <= n_runs <= 20):
+            raise ValueError("n_runs must be between 1 and 20")
         output_frame = str(inp.get("output_frame", "original")).lower()
         if output_frame not in ("original", "model", "rotated"):
             raise ValueError("output_frame must be 'original' or 'model'")
@@ -241,7 +265,7 @@ def handler(job):
 
             # 4. CrossTooth inference ------------------------------------------
             t = time.time()
-            labels_low, centers_low, faces_low, pts_low = predict_labels(dec_path)
+            labels_low, centers_low, faces_low, pts_low, agreement = predict_labels(dec_path, seed=seed, n_runs=n_runs)
             if DEVICE.type == "cuda":
                 torch.cuda.synchronize()
             timings["inference"] = time.time() - t
@@ -268,6 +292,9 @@ def handler(job):
                 "n_faces": int(len(faces)),
                 "n_faces_decimated": int(dec.ncells),
                 "n_faces_predicted": int(len(labels_low)),
+                "seed": seed,
+                "n_runs": n_runs,
+                "run_agreement": float(agreement.mean()),
                 "output_frame": "original" if output_frame == "original" else "model",
                 "ply_binary": not ascii_ply,
             }
@@ -297,6 +324,7 @@ def handler(job):
             "names": {str(i): names[i] for i in range(17)},
             "fdi": {str(i): fdi[i] for i in fdi} if fdi else None,
             "face_counts": {str(i): int(counts[i]) for i in present},
+            "run_agreement": {str(i): float(agreement[labels_low == i].mean()) for i in np.unique(labels_low)},
         }
         result["orientation"] = orient
         timings["total"] = time.time() - t_all
@@ -317,7 +345,7 @@ if os.environ.get("WARMUP", "1") == "1" and DEVICE.type == "cuda":
     sample = os.path.join(REPO_DIR, "YBSESUN6_upper.ply")
     if os.path.exists(sample):
         t_w = time.time()
-        lab, _, _, _ = predict_labels(sample)
+        lab, _, _, _, _ = predict_labels(sample)
         print(f"[init] warm-up ok: {len(np.unique(lab[lab > 0]))} teeth on the sample scan "
               f"in {time.time() - t_w:.1f}s", flush=True)
 
